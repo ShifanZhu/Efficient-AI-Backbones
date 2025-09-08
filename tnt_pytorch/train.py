@@ -69,6 +69,29 @@ parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
                     help='YAML config file specifying default arguments')
 
 
+class LabelShift(torch.utils.data.Dataset):
+    def __init__(self, ds, shift=-1, check_range=None):
+        self.ds = ds
+        self.shift = shift
+        self.check_range = check_range
+
+    # preserve important attributes that create_loader / timm may set or read
+    def __getattr__(self, name):
+        return getattr(self.ds, name)
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        img, target = self.ds[idx]           # img will still get transforms applied by create_loader
+        target = int(target) + self.shift
+        if self.check_range is not None:
+            lo, hi = self.check_range
+            if not (lo <= target <= hi):
+                raise ValueError(f"Shifted label {target} out of range [{lo}, {hi}]")
+        return img, target
+
+
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 
 # Dataset / Model parameters
@@ -84,8 +107,8 @@ parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='Resume full model and optimizer state from checkpoint (default: none)')
 parser.add_argument('--no-resume-opt', action='store_true', default=False,
                     help='prevent resume of optimizer state when resuming model')
-parser.add_argument('--num-classes', type=int, default=1000, metavar='N',
-                    help='number of label classes (default: 1000)')
+parser.add_argument('--num-classes', type=int, default=196, metavar='N',
+                    help='number of label classes (default: 196)')
 parser.add_argument('--gp', default=None, type=str, metavar='POOL',
                     help='Global pool type, one of (fast, avg, max, avgmax, avgmaxc). Model default if None.')
 parser.add_argument('--img-size', type=int, default=None, metavar='N',
@@ -345,8 +368,41 @@ def main():
     if args.pretrain_path is not None:
         print('Loading:', args.pretrain_path)
         state_dict = torch.load(args.pretrain_path)
+
+
+
+    # modified by Shifan --- start ---
+
+        if not args.evaluate:
+            for key in list(state_dict.keys()):
+                if key.startswith('head.'):
+                    print('Delete', key)
+                    del state_dict[key]
+                # if 'classifier' in key:
+                #     print('Delete', key)
+                #     del state_dict[key]
         model.load_state_dict(state_dict, strict=False)
         print('Pretrain weights loaded.')
+
+
+    # 3) freeze backbone, keep head trainable
+    HEAD_PREFIXES = ('head.', 'fc.', 'classifier.')
+    for name, p in model.named_parameters():
+        p.requires_grad = name.startswith(HEAD_PREFIXES)
+
+    # # (optional but recommended) freeze BN stats in frozen backbone
+    # for name, m in model.named_modules():
+    #     if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.SyncBatchNorm)):
+    #         # If this BN's params are all frozen, keep it in eval mode (no running stat updates)
+    #         if not any(p.requires_grad for p in m.parameters(recurse=False)):
+    #             m.eval()
+    #             for p in m.parameters(recurse=False):
+    #                 p.requires_grad = False
+
+    # modified by Shifan --- end ---
+
+
+
     ################### flops #################
     print(model)
     if hasattr(model, 'default_cfg'):
@@ -404,6 +460,8 @@ def main():
             model = model.to(memory_format=torch.channels_last)
 
     optimizer = create_optimizer(args, model)
+    # trainable = [p for p in model.parameters() if p.requires_grad]
+    # optimizer = create_optimizer(args, trainable)
 
     amp_autocast = suppress  # do nothing
     loss_scaler = None
@@ -483,6 +541,7 @@ def main():
         _logger.error('Training folder does not exist at: {}'.format(train_dir))
         exit(1)
     dataset_train = Dataset(train_dir)
+    # dataset_train = LabelShift(dataset_train, shift=-1, check_range=(0,195))
 
     collate_fn = None
     mixup_fn = None
@@ -540,6 +599,7 @@ def main():
             _logger.error('Validation folder does not exist at: {}'.format(eval_dir))
             exit(1)
     dataset_eval = Dataset(eval_dir)
+    # dataset_eval  = LabelShift(dataset_eval,  shift=-1, check_range=(0,195))
 
     loader_eval = create_loader(
         dataset_eval,
@@ -805,3 +865,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
 
 if __name__ == '__main__':
     main()
+
+
+# python inference.py   --data-root data/cars   --test-csv data/cars/test.csv   --checkpoint models/train/20250906-124951-resnet101-224/model_best.pth.tar   --model-name resnet101   --num-classes 1000   --batch-size 32   --use-bbox
+# torchrun --nproc_per_node=1 train.py data/cars/ --model tnt_s_patch16_224 --num-classes 196 --pretrain_path models/tnt_s_81.5.pth.tar  --sched cosine --epochs 300 --opt adamw -j 8 --warmup-lr 1e-6 --mixup .8 --cutmix 1.0 --model-ema --model-ema-decay 0.99996 --aa rand-m9-mstd0.5-inc1 --color-jitter 0.4 --warmup-epochs 5 --opt-eps 1e-8 --repeated-aug --remode pixel --reprob 0.25 --amp --lr 1e-3 --weight-decay .05 --drop 0 --drop-path .1 -b 128 --output models/
